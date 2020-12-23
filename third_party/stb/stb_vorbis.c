@@ -121,6 +121,15 @@ typedef struct
 
 typedef struct stb_vorbis stb_vorbis;
 
+enum STBVorbisSeekPositions
+{
+   STB_VORBIS_seekposition_start,
+   STB_VORBIS_seekposition_current=1,
+};
+
+typedef size_t (read_callback_func)(void *user_data, void *output, size_t count);
+typedef int (seek_callback_func)(void *user_data, int position, enum STBVorbisSeekPositions direction);
+
 typedef struct
 {
    unsigned int sample_rate;
@@ -258,6 +267,10 @@ extern stb_vorbis * stb_vorbis_open_memory(const unsigned char *data, int len,
                                   int *error, const stb_vorbis_alloc *alloc_buffer);
 // create an ogg vorbis decoder from an ogg vorbis stream in memory (note
 // this must be the entire stream!). on failure, returns NULL and sets *error
+
+extern stb_vorbis * stb_vorbis_open_callback(void *user_data, const
+read_callback_func *read_callback, const seek_callback_func *seek_callback,
+                                  int length, int *error, const stb_vorbis_alloc *alloc_buffer);
 
 #ifndef STB_VORBIS_NO_STDIO
 extern stb_vorbis * stb_vorbis_open_filename(const char *filename,
@@ -783,6 +796,11 @@ struct stb_vorbis
    uint32 f_start;
    int close_on_free;
 #endif
+
+   read_callback_func *read_callback;
+   seek_callback_func *seek_callback;
+   void *user_data;
+    unsigned int  read_position;
 
    uint8 *stream;
    uint8 *stream_start;
@@ -1315,11 +1333,24 @@ static int STBV_CDECL point_compare(const void *p, const void *q)
    #define USE_MEMORY(z)    ((z)->stream)
 #endif
 
+   #define USE_CALLBACK(z)    ((z)->read_callback)
+
 static uint8 get8(vorb *z)
 {
    if (USE_MEMORY(z)) {
       if (z->stream >= z->stream_end) { z->eof = TRUE; return 0; }
       return *z->stream++;
+   }
+
+   if (USE_CALLBACK(z))
+         {
+         char c;
+         if (!z->read_callback(z->user_data, &c, 1)) {
+            z->eof = 1;
+            return 0;
+         }
+         z->read_position ++;
+         return c;
    }
 
    #ifndef STB_VORBIS_NO_STDIO
@@ -1350,6 +1381,17 @@ static int getn(vorb *z, uint8 *data, int n)
       return 1;
    }
 
+   if (USE_CALLBACK(z)) {
+      int count;
+      count = z->read_callback(z->user_data, data, n);
+      z->read_position += count;
+      if (count < n) {
+         z->eof = 1;
+         return 0;
+      }
+      return 1;
+   }
+
    #ifndef STB_VORBIS_NO_STDIO
    if (fread(data, n, 1, z->f) == 1)
       return 1;
@@ -1365,6 +1407,14 @@ static void skip(vorb *z, int n)
    if (USE_MEMORY(z)) {
       z->stream += n;
       if (z->stream >= z->stream_end) z->eof = 1;
+      return;
+   }
+   if(USE_CALLBACK(z)) {
+        char buf[n];
+        int r;
+        if ((r = z->read_callback(z->user_data, buf, n)) < n)
+         z->eof = 1;
+      z->read_position += r;
       return;
    }
    #ifndef STB_VORBIS_NO_STDIO
@@ -1390,6 +1440,16 @@ static int set_file_offset(stb_vorbis *f, unsigned int loc)
          f->stream = f->stream_start + loc;
          return 1;
       }
+   }
+   if(f->seek_callback) {
+   if (loc + f->f_start < loc || loc >= 0x80000000) {
+      loc = 0x7fffffff;
+      f->eof = 1;
+   } else {
+      loc += f->f_start;
+   }
+   f->read_position = loc;
+      return f->seek_callback(f->user_data, loc, STB_VORBIS_seekposition_start);
    }
    #ifndef STB_VORBIS_NO_STDIO
    if (loc + f->f_start < loc || loc >= 0x80000000) {
@@ -4520,6 +4580,7 @@ unsigned int stb_vorbis_get_file_offset(stb_vorbis *f)
    if (f->push_mode) return 0;
    #endif
    if (USE_MEMORY(f)) return (unsigned int) (f->stream - f->stream_start);
+   if (USE_CALLBACK(f)) return (unsigned int) f->read_position;
    #ifndef STB_VORBIS_NO_STDIO
    return (unsigned int) (ftell(f->f) - f->f_start);
    #endif
@@ -5050,6 +5111,30 @@ stb_vorbis * stb_vorbis_open_file(FILE *file, int close_on_free, int *error, con
    len = (unsigned int) (ftell(file) - start);
    fseek(file, start, SEEK_SET);
    return stb_vorbis_open_file_section(file, close_on_free, error, alloc, len);
+}
+
+stb_vorbis * stb_vorbis_open_callback(void *user_data, const read_callback_func *read_callback, const seek_callback_func *seek_callback,
+int length, int *error, const stb_vorbis_alloc *alloc)
+{
+   stb_vorbis *f, p;
+   vorbis_init(&p, alloc);
+   p.user_data = user_data;
+   p.read_callback = read_callback;
+   p.seek_callback = seek_callback;
+   p.f_start = 0;
+   p.stream_len   = length;
+   p.read_position = 0;
+   if (start_decoder(&p)) {
+      f = vorbis_alloc(&p);
+      if (f) {
+         *f = p;
+         vorbis_pump_first_frame(f);
+         return f;
+      }
+   }
+   if (error) *error = p.error;
+   vorbis_deinit(&p);
+   return NULL;
 }
 
 stb_vorbis * stb_vorbis_open_filename(const char *filename, int *error, const stb_vorbis_alloc *alloc)

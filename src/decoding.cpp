@@ -18,7 +18,8 @@ struct DecoderDef {
 static auto decoders = makeStaticArray(
 	DecoderDef{"dr_wav", decodeWav},
 	DecoderDef{"dr_flac", decodeFlac},
-	DecoderDef{"dr_mp3", decodeMp3}
+	DecoderDef{"dr_mp3", decodeMp3},
+	DecoderDef{"stb_vorbis", decodeOgg}
 );
 
 std::shared_ptr<AudioDecoder> getDecoderForProtocol(std::string protocol, std::string path, std::string options) {
