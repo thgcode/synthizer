@@ -1,5 +1,6 @@
 #include "synthizer.h"
 #include "synthizer_constants.h"
+
 #include "synthizer/property_xmacros.hpp"
 
 #include "synthizer/audio_output.hpp"
@@ -39,6 +40,9 @@ void Context::initContext( bool headless) {
 
 	this->audio_output = createAudioOutput([ctx_weak] (unsigned int channels, float *buffer) {
 		auto ctx_strong = ctx_weak.lock();
+		if (ctx_strong == nullptr) {
+			return;
+		}
 		ctx_strong->generateAudio(channels, buffer);
 	});
 	this->running.store(1);
@@ -53,6 +57,10 @@ Context::~Context() {
 
 std::shared_ptr<Context> Context::getContext() {
 	return this->shared_from_this();
+}
+
+int Context::getObjectType() {
+	return SYZ_OTYPE_CONTEXT;
 }
 
 void Context::shutdown() {
@@ -70,6 +78,10 @@ void Context::shutdown() {
 		this->delete_directly.store(1);
 	}
 	this->drainDeletionQueues();
+	/* We're shut down, just deinitialize all of them to kill strong references. */
+	this->command_queue.processAll([] (auto &cmd) {
+		cmd.deinitialize();
+	});
 }
 
 void Context::cDelete() {
@@ -80,7 +92,7 @@ void Context::cDelete() {
 template<typename T>
 void Context::propertySetter(const std::shared_ptr<BaseObject> &obj, int property, T &value) {
 	obj->validateProperty(property, value);
-	this->enqueueCallableCommand(setPropertyCmd, property, obj, property_impl::PropertyValue(value));
+	this->enqueueReferencingCallbackCommand(true, setPropertyCmd, property, obj, property_impl::PropertyValue(value));
 }
 
 void Context::setIntProperty(std::shared_ptr<BaseObject> &obj, int property, int value) {
@@ -105,14 +117,14 @@ void Context::setDouble6Property(std::shared_ptr<BaseObject> &obj, int property,
 
 void Context::registerSource(const std::shared_ptr<Source> &source) {
 	/* We can capture this because, in order to invoke the command, we have to still have the context around. */
-	enqueueCallableCommand([this] (auto &src) {
+	this->enqueueReferencingCallbackCommand(true, [this] (auto &src) {
 		this->sources[src.get()] = src;
 	}, source);
 }
 
 void Context::registerGlobalEffect(const std::shared_ptr<GlobalEffect> &effect) {
 	/* We can capture this because, in order to invoke the command, we have to still have the context around. */
-	this->enqueueCallableCommand([this] (auto &effect) {
+	this->enqueueReferencingCallbackCommand(true, [this] (auto &effect) {
 		this->global_effects.push_back(effect);
 	}, effect);
 }
@@ -140,7 +152,18 @@ void Context::generateAudio(unsigned int channels, float *destination) {
 			rec.callback(rec.arg);
 		}
 
+
 		std::fill(destination, destination + channels * config::BLOCK_SIZE, 0.0f);
+
+		/**
+		 * This is the first safe place to actually pause: the output is definitely playing silence, and all commands have executed.
+		 * While we can pause the context, and pausing the context pauses everything undernneath, pausing the queues will cause unrecoverable deadlocks because it will be impossible
+		 * to unpause and the queues will eventually fill.
+		 * */
+		if (this->isPaused()) {
+			return;
+		}
+	
 		std::fill(this->getDirectBuffer(), this->getDirectBuffer() + config::BLOCK_SIZE * channels, 0.0f);
 
 		auto i = this->sources.begin();
@@ -167,6 +190,31 @@ void Context::generateAudio(unsigned int channels, float *destination) {
 			destination[i] += this->direct_buffer[i];
 		}
 
+		/**
+		 * Handle gain. Note that destination was zeroed and only contains audio from this invocation, so the final step is to
+		 * 
+		 * This must come after commands, which might change the property.
+		 * */
+		double new_gain;
+		if (this->acquireGain(new_gain) || this->shouldIncorporatePausableGain()) {
+			new_gain *= this->getPausableGain();
+			this->gain_driver.setValue(this->block_time, new_gain);
+		}
+		/**
+		 * Can tick the pausable here.
+		 * */
+		this->tickPausable();
+
+		this->gain_driver.drive(this->block_time, [&](auto &gain_cb) {
+			for (unsigned int i = 0; i < config::BLOCK_SIZE; i++) {
+				float g = gain_cb(i);
+				for (unsigned int ch = 0; ch < channels; ch++) {
+					unsigned int ind = i * channels + ch;
+					destination[ind] *= g;
+				}
+			}
+		});
+
 		this->block_time++;
 	} catch(...) {
 		logError("Got an exception in the audio callback");
@@ -176,6 +224,7 @@ void Context::generateAudio(unsigned int channels, float *destination) {
 void Context::runCommands() {
 	this->command_queue.processAll([&](auto &cmd) {
 		try {
+			auto deinit = AtScopeExit([&] () { cmd.deinitialize(); });
 			cmd.execute();
 		} catch(std::exception &e) {
 			logError("Got exception applying property write: %s", e.what());

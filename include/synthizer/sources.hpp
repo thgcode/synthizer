@@ -4,8 +4,10 @@
 
 #include "synthizer/base_object.hpp"
 #include "synthizer/config.hpp"
+#include "synthizer/fade_driver.hpp"
 #include "synthizer/faders.hpp"
 #include "synthizer/memory.hpp"
+#include "synthizer/pausable.hpp"
 #include "synthizer/property_internals.hpp"
 #include "synthizer/routable.hpp"
 #include "synthizer/spatialization_math.hpp"
@@ -23,7 +25,7 @@ class Context;
 class Generator;
 class PannerLane;
 
-class Source: public RouteOutput {
+class Source: public RouteOutput, public Pausable {
 	public:
 	Source(std::shared_ptr<Context> ctx): RouteOutput(ctx) {
 		this->setGain(1.0);
@@ -48,7 +50,7 @@ class Source: public RouteOutput {
 	/*
 	 * An internal buffer, which accumulates all generators.
 	 * */
-	alignas(config::ALIGNMENT) std::array<float, config::BLOCK_SIZE * config::ALIGNMENT> block;
+	std::array<float, config::BLOCK_SIZE * config::MAX_CHANNELS> block;
 
 	/*
 	 * Fill the internal block, downmixing and/or upmixing generators
@@ -60,13 +62,14 @@ class Source: public RouteOutput {
 
 	private:
 	deferred_vector<std::weak_ptr<Generator>> generators;
-	LinearFader gain_fader{1.0f};
+	FadeDriver gain_fader = {1.0f, 1};
 };
 
 class DirectSource: public Source {
 	public:
 	DirectSource(std::shared_ptr<Context> ctx): Source(ctx) {}
 
+	int getObjectType() override;
 	void run() override;
 };
 
@@ -78,6 +81,8 @@ class DirectSource: public Source {
 class PannedSource: public Source {
 	public:
 	PannedSource(std::shared_ptr<Context> context);
+
+	int getObjectType() override;
 
 	/* For 	Source3D. */
 	void setGain3D(double gain);
@@ -98,6 +103,7 @@ class Source3D: public PannedSource {
 	Source3D(std::shared_ptr<Context> context);
 	void initInAudioThread() override;
 
+	int getObjectType() override;
 	void run() override;
 
 	#define PROPERTY_CLASS Source3D

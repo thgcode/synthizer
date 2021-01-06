@@ -3,6 +3,7 @@
 #include "synthizer.h"
 
 #include "synthizer/error.hpp"
+#include "synthizer/trylock.hpp"
 
 #include "plf_colony.h"
 
@@ -40,50 +41,14 @@ void shutdownMemorySubsystem();
  * is kept to a minimum.
  * */
 typedef void freeCallback(void *value);
-void deferredFree(freeCallback *cb, void *value);
+void deferredFreeCallback(freeCallback *cb, void *value);
 
-#ifdef _WIN32
-template<typename T>
-T* allocAligned(std::size_t elements, std::size_t alignment = config::ALIGNMENT) {
-	void *d;
-	if constexpr (std::is_same<T, void>::value) {
-		d = _aligned_malloc(elements, alignment);
-	} else {
-		d = _aligned_malloc(elements * sizeof(T), std::max(alignment, alignof(T)));
-	}
-
-	if (d == nullptr)
-		throw std::bad_alloc();
-
-	return (T*) d;
+/**
+ * Drop-in replacement for free that deferrs to a background thread.
+ * */
+static void deferredFree(void *ptr) {
+	deferredFreeCallback(free, ptr);
 }
-
-template<typename T>
-void freeAligned(T* ptr) {
-	deferredFree(_aligned_free, (void *)ptr);
-}
-
-#else
-
-template<typename T>
-T* allocAligned(std::size_t elements, std::size_t alignment = config::ALIGNMENT) {
-	void *d;
-
-	if constexpr (std::is_same<T, void>::value) {
-		d = std::aligned_alloc(alignment, elements);
-	} else {
-		d = std::aligned_alloc(std::max(alignment, alignof(T)), elements * sizeof(T));
-	}
-	if (d == nullptr)
-		throw std::bad_alloc();
-	return (T*) d;
-}
-
-template<typename T>
-void freeAligned(T* ptr) {
-	deferredFree(std::free, (void *)ptr);
-}
-#endif
 
 template<typename T>
 class DeferredAllocator {
@@ -99,11 +64,7 @@ class DeferredAllocator {
 
 	value_type *allocate(std::size_t n) {
 		void *ret;
-		if (alignof(value_type) <= alignof(std::max_align_t)) {
-			ret = std::malloc(sizeof(value_type) * n);
-		} else {
-			ret = allocAligned<void *>(n, alignof(value_type));
-		}
+		ret = std::malloc(sizeof(value_type) * n);
 		if (ret == nullptr) {
 			throw std::bad_alloc();
 		}
@@ -111,11 +72,7 @@ class DeferredAllocator {
 	}
 
 	void deallocate(T *p, std::size_t n) {
-		if (alignof(value_type) <= alignof(std::max_align_t)) {
-			deferredFree(free, (void *)p);
-		} else {
-			freeAligned<void>((void *)p);
-		}
+		deferredFree((void *)p);
 	}
 };
 
@@ -158,6 +115,18 @@ std::shared_ptr<T> allocateSharedDeferred(ARGS&&... args) {
  * Infrastructure for marshalling C objects to/from Synthizer.
  * */
 
+class UserdataDef {
+	public:
+	~UserdataDef();
+	void *getAtomic();
+	void set(void *userdata, syz_UserdataFreeCallback *userdata_free_callback);
+
+	private:
+	void maybeFreeUserdata();
+	std::atomic<void *> userdata = nullptr;
+	syz_UserdataFreeCallback *userdata_free_callback = nullptr;
+};
+
 class CExposable  {
 	public:
 	CExposable();
@@ -174,11 +143,24 @@ class CExposable  {
 		return this->c_handle.compare_exchange_strong(zero, handle, std::memory_order_relaxed);
 	}
 
+	/**
+	 * Should return one of the SYZ_OTYPE_ constants.
+	 * */
+	virtual int getObjectType() = 0;
+
+	void *getUserdata();
+	void setUserdata(void *userdata, syz_UserdataFreeCallback *userdata_free_callback);
+
 	bool isPermanentlyDead() {
 		return this->permanently_dead.load(std::memory_order_relaxed) == 1;
 	}
 
-	/* Returns true if the object was alive previously. Used to ensure only one caller to cDelete. */
+	/**
+	 * Called from the C API to hide this object from the C API.  Since objects can linger until the next context tick,
+	 * we want to hide the delete latency by immediately considering the object invalid.
+	 * 
+	 * Returns true if the object was alive previously. Used to ensure only one caller to cDelete.
+	 * */
 	bool becomePermanentlyDead() {
 		unsigned char zero = 0;
 		return this->permanently_dead.compare_exchange_strong(zero, 1, std::memory_order_relaxed);
@@ -194,6 +176,7 @@ class CExposable  {
 	private:
 	std::atomic<syz_Handle> c_handle;
 	std::atomic<unsigned char> permanently_dead = 0;
+	TryLock<UserdataDef> userdata{};
 };
 
 void freeCImpl(std::shared_ptr<CExposable> &obj);
@@ -230,6 +213,20 @@ std::shared_ptr<T> fromC(syz_Handle handle) {
 	auto ret = std::dynamic_pointer_cast<T>(h);
 	if (ret == nullptr) throw EHandleType();
 	return ret;
+}
+
+/**
+ * Does a dynamic_pointer_cast, throwing EHandleType instead of returning nullptr.
+ * 
+ * This is used for things like Pausable, where the inheritance hierarchy forces us to use mixins but we still need to sidestep to BaseObject.
+ * */
+template<typename O, typename I>
+std::shared_ptr<O> typeCheckedDynamicCast(const std::shared_ptr<I> &input) {
+	auto out = std::dynamic_pointer_cast<O>(input);
+	if (out == nullptr) {
+		throw EHandleType();
+	}
+	return out;
 }
 
 void clearAllCHandles();

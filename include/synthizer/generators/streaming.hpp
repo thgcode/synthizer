@@ -16,14 +16,17 @@ namespace synthizer {
 
 class AudioDecoder;
 class Context;
+class FadeDriver;
 
 class StreamingGenerator: public Generator {
 	public:
 	StreamingGenerator(const std::shared_ptr<Context> &ctx, const std::shared_ptr<AudioDecoder> &decoder);
 	~StreamingGenerator();
 
+	int getObjectType() override;
 	unsigned int getChannels() override;
-	void generateBlock(float *output) override;
+	void generateBlock(float *output, FadeDriver *gain_driver) override;
+
 	#define PROPERTY_CLASS StreamingGenerator
 	#define PROPERTY_LIST STREAMING_GENERATOR_PROPERTIES
 	#define PROPERTY_BASE Generator

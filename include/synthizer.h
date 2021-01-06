@@ -74,13 +74,41 @@ SYZ_CAPI syz_ErrorCode syz_getLastErrorCode();
  * */
 SYZ_CAPI const char *syz_getLastErrorMessage();
 
-SYZ_CAPI syz_ErrorCode syz_handleFree(syz_Handle handle);
-
 /*
  * Library initialization and shutdown.
  * */
 SYZ_CAPI syz_ErrorCode syz_initialize();
 SYZ_CAPI syz_ErrorCode syz_shutdown();
+/**
+ * Free a C handle.
+ * */
+SYZ_CAPI syz_ErrorCode syz_handleFree(syz_Handle handle);
+
+/**
+ * Query the type of a handle. Returns one of the SYZ_OTYPE constants.
+ * */
+SYZ_CAPI syz_ErrorCode syz_handleGetObjectType(int *out, syz_Handle handle);
+
+/**
+ * Userdata support. It is possible to use the following interface to associate arbitrary pointers with Synthizer objects.  If
+ * the free_callback is non-NULL, Synthizer will call it on a background thread at the time of the object's death.
+ * 
+ * An example use for this interface is to associate game objects with Synthizer handles.
+ * 
+ * Note that there is a latency on the order of 50MS from syz_freeHandle to the userdata freeing callback being called, and latency on the order
+ * of 20ms for calling the same callback when userdata is set to a different value. Both of these
+ * values are rough worst cases, and it's usually faster. In particular, frequent updates to userdata will effectively batch frees, and the case wherein Synthizer keeps
+ * large amounts of userdata alive beyond the next ~100ms or so due to this latency isn't possible.
+ * */
+SYZ_CAPI syz_ErrorCode syz_getUserdata(void **out, syz_Handle handle);
+typedef void syz_UserdataFreeCallback(void *);
+SYZ_CAPI syz_ErrorCode syz_setUserdata(syz_Handle handle, void *userdata, syz_UserdataFreeCallback *free_callback);
+
+/**
+ * pause/play objects. Supported by everything that produces audio in some fashion: generators, sources, context, etc.
+ * */
+SYZ_CAPI syz_ErrorCode syz_pause(syz_Handle object);
+SYZ_CAPI syz_ErrorCode syz_play(syz_Handle object);
 
 /*
  * Property getters and setters.

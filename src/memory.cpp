@@ -1,6 +1,7 @@
 #include "synthizer.h"
 
 #include "synthizer/concurrent_slab.hpp"
+#include "synthizer/error.hpp"
 #include "synthizer/logging.hpp"
 #include "synthizer/memory.hpp"
 
@@ -136,28 +137,44 @@ static std::thread deferred_free_thread;
 static std::atomic<int> deferred_free_thread_running = 0;
 thread_local static bool is_deferred_free_thread = false;
 
-static void deferredFreeWorker() {
+unsigned int drainDeferredFreeQueue() {
 	decltype(deferred_free_queue)::consumer_token_t token{deferred_free_queue};
+	DeferredFreeEntry ent;
+	unsigned int processed = 0;
+
+	while (deferred_free_queue.try_dequeue(token, ent)) {
+		try {
+			ent.cb(ent.value);
+		} catch(...) {
+			logDebug("Exception on memory freeing thread. This should never happen");
+		}
+		processed++;
+	}
+
+	return processed;
+}
+
+static void deferredFreeWorker() {
 	std::size_t processed = 0;
 	is_deferred_free_thread = true;
+
 	while (deferred_free_thread_running.load(std::memory_order_relaxed)) {
-		DeferredFreeEntry ent;
-		while (deferred_free_queue.try_dequeue(token, ent)) {
-			try {
-				ent.cb(ent.value);
-			} catch(...) {
-				logDebug("Exception on memory freeing thread. This should never happen");
-			}
-			processed++;
-		}
+			processed += drainDeferredFreeQueue();
 		/* Sleep for a bit so that we don't overload the system when we're not freeing. */
 		std::this_thread::sleep_for(std::chrono::milliseconds(30));
 	}
 
+	/**
+	 * Always drain the queue on the way out. This ensures that if the user calls syz_shutdown
+	 * before exiting their app by enough to matter, the queue always drains. User-facing pointers are exposed via this queue, so it is
+	 * necessary to make sure that users cannot see failures of the freeing thread to free.
+	 * */
+	processed += drainDeferredFreeQueue();
+
 	logDebug("Deferred free processed %zu frees in a background thread", processed);
 }
 
-void deferredFree(freeCallback *cb, void *value) {
+void deferredFreeCallback(freeCallback *cb, void *value) {
 	thread_local decltype(deferred_free_queue)::producer_token_t token{deferred_free_queue};
 
 	if (deferred_free_thread_running.load() ==0 ) {
@@ -182,6 +199,45 @@ void initializeMemorySubsystem() {
 void shutdownMemorySubsystem() {
 	deferred_free_thread_running.store(0);
 	deferred_free_thread.join();
+}
+
+UserdataDef::~UserdataDef() {
+	this->maybeFreeUserdata();
+}
+
+void UserdataDef::set(void *userdata, syz_UserdataFreeCallback *userdata_free_callback) {
+	this->maybeFreeUserdata();
+	this->userdata.store(userdata, std::memory_order_relaxed);
+	this->userdata_free_callback = userdata_free_callback;
+}
+
+void *UserdataDef::getAtomic() {
+	return this->userdata.load(std::memory_order_relaxed);
+}
+
+void UserdataDef::maybeFreeUserdata() {
+	void *ud = this->userdata.load(std::memory_order_relaxed);
+	if (ud != nullptr && this->userdata_free_callback != nullptr) {
+		deferredFreeCallback(this->userdata_free_callback, ud);
+	}
+	this->userdata = nullptr;
+	this->userdata_free_callback = nullptr;
+}
+
+void *CExposable::getUserdata() {
+	auto *inner = this->userdata.unsafeGetInner();
+	return inner->getAtomic();
+}
+
+void CExposable::setUserdata(void *userdata, syz_UserdataFreeCallback *userdata_free_callback) {
+	bool did_set = this->userdata.withLock([&] (auto *u) {
+		u->set(userdata, userdata_free_callback);
+	});
+
+	/* We lost the race. */
+	if (did_set == false && userdata != nullptr && userdata_free_callback != nullptr) {
+		deferredFreeCallback(userdata_free_callback, userdata);
+	}
 }
 
 }

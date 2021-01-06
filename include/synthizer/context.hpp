@@ -3,7 +3,9 @@
 #include "synthizer/base_object.hpp"
 #include "synthizer/commands.hpp"
 #include "synthizer/config.hpp"
+#include "synthizer/fade_driver.hpp"
 #include "synthizer/panner_bank.hpp"
+#include "synthizer/pausable.hpp"
 #include "synthizer/property_internals.hpp"
 #include "synthizer/mpsc_ring.hpp"
 #include "synthizer/router.hpp"
@@ -44,7 +46,7 @@ template<typename T>
 void deletionCallback(void *p) {
 	T *y = (T*) p;
 	y->~T();
-	deferredFree(contextDeferredFreeCallback<alignof(T)>, (void *)y);
+	deferredFreeCallback(contextDeferredFreeCallback<alignof(T)>, (void *)y);
 }
 
 /*
@@ -60,7 +62,7 @@ void deletionCallback(void *p) {
  * 
  * Unless otherwise noted, the functions of this class should only be called from the context-managed thread.
  * */
-class Context: public BaseObject, public std::enable_shared_from_this<Context> {
+class Context: public Pausable, public BaseObject, public std::enable_shared_from_this<Context> {
 	public:
 
 	Context();
@@ -78,6 +80,8 @@ class Context: public BaseObject, public std::enable_shared_from_this<Context> {
 		return this;
 	}
 
+	int getObjectType() override;
+
 
 	/*
 	 * Shut the context down.
@@ -92,21 +96,55 @@ class Context: public BaseObject, public std::enable_shared_from_this<Context> {
 	 * if there was no room in the queue.
 	 * */
 	template<typename CB, typename ...ARGS>
-	bool enqueueCallableCommandNonblocking(CB &&callback, ARGS&& ...args) {
+	bool enqueueCallbackCommandNonblocking(CB &&callback, ARGS&& ...args) {
+		if (this->headless) {
+			callback(args...);
+			return true;
+		}
+
+		/* If the context isn't running, it's shut down. Currently, contexts can't be restarted, and we don't fully support headless contexts yet. */
+		if (this->running.load(std::memory_order_relaxed) == 0) {
+			return true;
+		}
+
 		return this->command_queue.write([&](auto &cmd) {
-			initCallbackCommand(&cmd, std::forward<CB>(callback), std::forward<ARGS>(args)...);
+			initCallbackCommand(&cmd, callback, args...);
 		});
 	}
 
 	/**
-	 * Like enqueueCallableCommandNonblocking, but spins.
+	 * Like enqueueCallbackCommandNonblocking, but spins.
 	 * 
 	 * In practice, code goes through this one instead, and we rely on knowing that there's a reasonable size for the command queue that will
 	 * reasonably ensure no one ever spins for practical applications.
 	 * */
 	template<typename CB, typename... ARGS>
-	void enqueueCallableCommand(CB &&callback, ARGS&& ...args) {
-		while (this->enqueueCallableCommandNonblocking(callback, args...) == false) {
+	void enqueueCallbackCommand(CB &&callback, ARGS&& ...args) {
+		while (this->enqueueCallbackCommandNonblocking(callback, args...) == false) {
+			std::this_thread::yield();
+		}
+	}
+
+	template<typename CB, typename ...ARGS>
+	bool enqueueReferencingCallbackCommandNonblocking(bool short_circuit, CB &&callback, ARGS&& ...args) {
+		if (this->headless) {
+			callback(args...);
+			return true;
+		}
+
+		/* If the context isn't running, it's shut down. Currently, contexts can't be restarted, and we don't fully support headless contexts yet. */
+		if (this->running.load(std::memory_order_relaxed) == 0) {
+			return true;
+		}
+
+		return this->command_queue.write([&](auto &cmd) {
+			initReferencingCallbackCommand(&cmd, short_circuit, callback, args...);
+		});
+	}
+
+	template<typename CB, typename ...ARGS>
+	void enqueueReferencingCallbackCommand(bool short_circuit, CB callback, ARGS ...args) {
+		while (this->enqueueReferencingCallbackCommandNonblocking(short_circuit, callback, args...) == false) {
 			std::this_thread::yield();
 		}
 	}
@@ -121,7 +159,7 @@ class Context: public BaseObject, public std::enable_shared_from_this<Context> {
 		});
 
 		/* Do the second phase of initialization. */
-		this->enqueueCallableCommand([] (auto &o) {
+		this->enqueueReferencingCallbackCommand(true, [] (auto &o) {
 			o->initInAudioThread();
 		}, obj);
 		return ret;
@@ -244,7 +282,7 @@ class Context: public BaseObject, public std::enable_shared_from_this<Context> {
 	/* Collections of objects that require execution: sources, etc. all go here eventually. */
 
 	/* direct_buffer is a buffer to which we write when we want to output, bypassing panner banks. */
-	alignas(config::ALIGNMENT) std::array<float, config::BLOCK_SIZE * config::MAX_CHANNELS> direct_buffer;
+	std::array<float, config::BLOCK_SIZE * config::MAX_CHANNELS> direct_buffer;
 
 	/* The key is a raw pointer for easy lookup. */
 	deferred_unordered_map<void *, std::weak_ptr<Source>> sources;
@@ -260,6 +298,8 @@ class Context: public BaseObject, public std::enable_shared_from_this<Context> {
 
 	/* Effects support. */
 	router::Router router{};
+
+	FadeDriver gain_driver{1.0f, 1};
 };
 
 }

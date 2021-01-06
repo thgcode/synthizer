@@ -2,10 +2,12 @@
 
 #include "synthizer/sources.hpp"
 
+#include "synthizer/block_buffer_cache.hpp"
 #include "synthizer/c_api.hpp"
 #include "synthizer/channel_mixing.hpp"
 #include "synthizer/config.hpp"
 #include "synthizer/context.hpp"
+#include "synthizer/fade_driver.hpp"
 #include "synthizer/generator.hpp"
 #include "synthizer/math.hpp"
 #include "synthizer/types.hpp"
@@ -42,16 +44,27 @@ bool Source::hasGenerator(std::shared_ptr<Generator> &generator) {
 }
 
 void Source::fillBlock(unsigned int channels) {
-	alignas(config::ALIGNMENT) thread_local std::array<float, config::MAX_CHANNELS * config::BLOCK_SIZE> premix_array = {0.0f };
-	float *premix = &premix_array[0];
+	auto premix_guard = acquireBlockBuffer();
+	float *premix = premix_guard;
 	double gain_prop;
 	auto time = this->context->getBlockTime();
 
-	if (this->acquireGain(gain_prop)) {
-		this->gain_fader = LinearFader{time, this->gain_fader.getValue(time), time + 1, (float)gain_prop};
+	if (this->acquireGain(gain_prop) || this->shouldIncorporatePausableGain()) {
+		gain_prop *= this->getPausableGain();
+		this->gain_fader.setValue(time, gain_prop);
 	}
 
 	std::fill(&this->block[0], &this->block[0] + channels * config::BLOCK_SIZE, 0.0f);
+
+	/**
+	 * There is room for further optimization here, by communicating that this block is potentially zeros
+	 * to the derived source classes. We'll do that later, when we also have tracking of generator
+	 * silence and other scheduling related functionality that makes it advantageous for the other sources to drop their panners and so on.
+	 * */
+	if (this->isPaused()) {
+		return;
+	}
+	this->tickPausable();
 
 	/* iterate and remove as we go to avoid locking weak_ptr twice. */
 	weak_vector::iterate_removing(this->generators, [&] (auto &g) {
@@ -62,31 +75,22 @@ void Source::fillBlock(unsigned int channels) {
 		}
 
 		if (nch == channels) {
-			g->generateBlock(&this->block[0]);
+			g->run(&this->block[0]);
 		} else {
 			std::fill(premix, premix + config::BLOCK_SIZE * nch, 0.0f);
-			g->generateBlock(premix);
+			g->run(premix);
 			mixChannels(config::BLOCK_SIZE, premix, nch, &this->block[0], channels);
 		}
 	});
 
-	if (this->gain_fader.isFading(time)) {
-		float gain_start = this->gain_fader.getValue(time);
-		float gain_end = this->gain_fader.getValue(time+1);
-		for (unsigned int i = 0; i < config::BLOCK_SIZE; i++) {
-			float w2 = i / (float)config::BLOCK_SIZE;
-			float w1 = 1.0f - w2;
-			float g = gain_start*w1 + gain_end*w2;
+	this->gain_fader.drive(time, [&](auto &gain_cb) {
+		for (unsigned int i =  0; i < config::BLOCK_SIZE; i++) {
+			float g = gain_cb(i);
 			for (unsigned int ch = 0; ch < channels; ch++) {
 				this->block[i * channels + ch] *= g;
 			}
 		}
-	} else {
-		float gainf = gain_prop;
-		for (unsigned int i = 0; i < config::BLOCK_SIZE * channels; i++) {
-			this->block[i] *= gainf;
-		}
-	}
+	});
 
 	this->getOutputHandle()->routeAudio(&this->block[0], channels);
 }
@@ -99,7 +103,7 @@ SYZ_CAPI syz_ErrorCode syz_sourceAddGenerator(syz_Handle source, syz_Handle gene
 	SYZ_PROLOGUE
 	auto src = fromC<Source>(source);
 	auto gen = fromC<Generator>(generator);
-	src->getContextRaw()->enqueueCallableCommand([] (auto &src, auto &gen) {
+	src->getContextRaw()->enqueueReferencingCallbackCommand(true, [] (auto &src, auto &gen) {
 		src->addGenerator(gen);
 	}, src, gen);
 	return 0;
@@ -110,7 +114,7 @@ SYZ_CAPI syz_ErrorCode syz_sourceRemoveGenerator(syz_Handle source, syz_Handle g
 	SYZ_PROLOGUE
 	auto src = fromC<Source>(source);
 	auto gen = fromC<Generator>(generator);
-	src->getContextRaw()->enqueueCallableCommand([] (auto &src, auto &gen) {
+	src->getContextRaw()->enqueueReferencingCallbackCommand(true, [] (auto &src, auto &gen) {
 		src->removeGenerator(gen);
 	}, src, gen);
 	return 0;

@@ -3,6 +3,7 @@
 #include "synthizer.h"
 
 #include "synthizer/base_object.hpp"
+#include "synthizer/block_buffer_cache.hpp"
 #include "synthizer/c_api.hpp"
 #include "synthizer/channel_mixing.hpp"
 #include "synthizer/config.hpp"
@@ -48,45 +49,28 @@ OutputHandle::~OutputHandle() {
 }
 
 void OutputHandle::routeAudio(float *buffer, unsigned int channels) {
-	alignas(config::ALIGNMENT)  thread_local std::array<float, config::BLOCK_SIZE * config::MAX_CHANNELS> _working_buf;
-	auto *working_buf = &_working_buf[0];
+	auto working_buf_guard = acquireBlockBuffer();
+	float *working_buf = working_buf_guard;
+
 	auto start = this->router->findRun(this);
 	if (start == router->routes.end()) {
 		return;
 	}
+
 	for (auto route = start; route < router->routes.end() && route->output == this; route++) {
 		/* TODO: we need to prove that this can't happen. */
 		if (route->input == nullptr) {
 			continue;
 		}
 
-		float gain_start = route->fader.getValue(router->time);
-		float gain_end = route->fader.getValue(router->time + 1);
-		/*
-		 * Relise on the guarantee that faders are "perfect" from an fp perspective outside their range.
-		 * If this is ever not true, this code will still work, but will be very slow.
-		 * */
-		bool crossfading = gain_start != gain_end;
-		if (crossfading) {
+		route->gain_driver.drive(router->time, [&](auto &gain_cb) {
 			for (unsigned int frame = 0; frame < config::BLOCK_SIZE; frame ++) {
-				float w2 = frame / (float) config::BLOCK_SIZE;
-				float w1 = 1.0f - w2;
-				float gain = w1 * gain_start + w2 * gain_end;
+				float gain = gain_cb(frame);
 				for (unsigned int channel = 0; channel < channels; channel++) {
 					working_buf[frame * channels + channel] = gain * buffer[frame * channels + channel];
 				}
 			}
-		} else {
-			/* If we're here we might be able to just avoid doing it, if there's no gain. */
-			if (gain_end == 0.0f) {
-				continue;
-			}
-
-			/* Copy into working_buf, apply gain. */
-			for (unsigned int f = 0; f < config::BLOCK_SIZE * channels; f++) {
-				working_buf[f] = gain_end * buffer[f];
-			}
-		}
+		});
 		mixChannels(config::BLOCK_SIZE, working_buf, channels, route->input->buffer, route->input->channels);
 	}
 }
@@ -119,13 +103,7 @@ void Router::configureRoute(OutputHandle *output, InputHandle *input, float gain
 	}
 	to_configure->output = output;
 	to_configure->input = input;
-	/*
-	 * Replae the fader with one whose start gain is the current gain and whose end gain is the target.
-	 * 
-	 * This makes it so that a user hammering on the route configuration API should still get at least reasonable results.
-	 * */
-	float cgain = to_configure->fader.getValue(this->time);
-	to_configure->fader = LinearFader(this->time, cgain, this->time + fade_blocks, gain);
+	to_configure->gain_driver.setValue(this->time, gain);
 }
 
 void Router::removeRoute(OutputHandle *output, InputHandle *input, unsigned int fade_out) {
@@ -148,7 +126,7 @@ void Router::finishBlock() {
 	vector_helpers::filter_stable(this->routes, [&](auto &r) {
 		bool dead = r.output == nullptr ||
 			r.input == nullptr ||
-			(r.fader.getValue(this->time) == 0.0 && r.fader.isFading(this->time) == false);
+			r.gain_driver.isActiveAtTime(this->time) == false;
 		if (dead) {
 			return false;
 		}
@@ -225,11 +203,9 @@ SYZ_CAPI syz_ErrorCode syz_routingConfigRoute(syz_Handle context, syz_Handle out
 		// because the user asked for crossfade, but less than a block.
 		fade_time = 1;
 	}
-	auto ctx = obj_input->getContext();
-	auto ctx_weak = std::weak_ptr(ctx);
 
-	ctx->enqueueCallableCommand([&](auto &ctx_weak, auto &obj_output, auto &obj_input, auto &gain, auto &fade_time) {
-		auto ctx = ctx_weak.lock();
+	auto ctx = obj_input->getContext();
+	ctx->enqueueReferencingCallbackCommand(true, [](auto &ctx, auto &obj_output, auto &obj_input, auto &gain, auto &fade_time) {
 		if (ctx == nullptr) {
 			return;
 		}
@@ -237,7 +213,7 @@ SYZ_CAPI syz_ErrorCode syz_routingConfigRoute(syz_Handle context, syz_Handle out
 		auto input_handle = obj_input->getInputHandle();
 		auto r = ctx->getRouter();
 		r->configureRoute(output_handle, input_handle, gain, fade_time);
-	}, ctx_weak, obj_output, obj_input, gain, fade_time);
+	}, ctx, obj_output, obj_input, gain, fade_time);
 
 	return 0;
 	SYZ_EPILOGUE
@@ -266,16 +242,14 @@ SYZ_CAPI syz_ErrorCode syz_routingRemoveRoute(syz_Handle context, syz_Handle out
 	}
 
 	auto ctx = obj_input->getContext();
-	auto ctx_weak = std::weak_ptr(ctx);
-	ctx->enqueueCallableCommand([](auto &ctx_weak, auto &obj_output, auto &obj_input, auto &fade_out_blocks) {
-		auto ctx = ctx_weak.lock();
+	ctx->enqueueReferencingCallbackCommand(true, [](auto &ctx, auto &obj_output, auto &obj_input, auto &fade_out_blocks) {
 		if (ctx == nullptr) {
 			return;
 		}
 		auto output_handle = obj_output->getOutputHandle();
 		auto input_handle = obj_input->getInputHandle();
 		ctx->getRouter()->removeRoute(output_handle, input_handle, fade_out_blocks);
-	}, ctx_weak, obj_output, obj_input, fade_out_blocks);
+	}, ctx, obj_output, obj_input, fade_out_blocks);
 
 	return 0;
 	SYZ_EPILOGUE

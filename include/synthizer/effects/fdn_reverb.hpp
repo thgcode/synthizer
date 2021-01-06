@@ -1,5 +1,6 @@
 #pragma once
 
+#include "synthizer/block_buffer_cache.hpp"
 #include "synthizer/block_delay_line.hpp"
 #include "synthizer/channel_mixing.hpp"
 #include "synthizer/config.hpp"
@@ -230,8 +231,11 @@ void FdnReverbEffect<BASE>::maybeRecomputeModel() {
 	 * per sample, and multiplying by the length of the track.
 	 * 
 	 * We control this with an equalizer, which lets the user control how "bright" the reverb is.
+	 * 
+	 * be careful to guard against t60 = 0.  We could have done this by constraining the range of the propperty, but 
+	 * it is convenient for external consumers to be able to use 0 and t60 is already inaccurate, so a little bit more doesn't hurt anything.
 	 * */
-	float decay_per_sample_db = -60.0f / t60 / config::SR;
+	float decay_per_sample_db = -60.0f / (t60 + 0.001) / config::SR;
 	for (unsigned int i = 0; i < LINES; i++) {
 		unsigned int length = this->delays[i];
 		float decay_db = length * decay_per_sample_db;
@@ -271,8 +275,8 @@ void FdnReverbEffect<BASE>::runEffect(unsigned int time_in_blocks, unsigned int 
 	 * Output is stereo. For surround setups, we can get 99% of the benefit just by upmixing stereo differently, which we'll do in future by hand
 	 * as a special case.
 	 * */
-	alignas(config::ALIGNMENT) thread_local std::array<float, config::BLOCK_SIZE * 2> output_buf{ { 0.0f } };
-	float *output_buf_ptr = &output_buf[0];
+	auto output_buf_guard = acquireBlockBuffer();
+	float *const output_buf_ptr = output_buf_guard;
 
 	this->maybeRecomputeModel();
 

@@ -14,6 +14,7 @@ Creates a context configured to play through the default output device.
 
 Enum | Type | Default | Range | Description
 --- | --- | --- | --- | ---
+SYZ_P_GAIN | double | 1.0 | value >= 0.0 | The gain of the context
 SYZ_P_POSITION | double3 | (0, 0, 0) | any | The position of the listener.
 SYZ_P_ORIENTATION | double6 | (0, 1, 0, 0, 0, 1) | Two packed unit vectors | The orientation of the listener as `(atx, aty, atz, upx, upy, upz)`.
 SYZ_P_DISTANCE_MODEL | int | SYZ_DISTANCE_MODEL_LINEAR | any SYZ_DISTANCE_MODEL | The default distance model for new sources.
@@ -22,6 +23,19 @@ SYZ_P_DISTANCE_MAX | double | 50.0 | value >= 0.0 | The default max distance for
 SYZ_P_ROLLOFF | double | 1.0 | value >= 0.0 | The default rolloff for new sources.
 SYZ_P_CLOSENESS_BOOST | double | 0.0 | any finite double | The default closeness boost for new sources in DB.
 SYZ_P_CLOSENESS_BOOST_DISTANCE | double | 0.0 | value >= 0.0 | The default closeness boost distance for new sources
+
+## Functions
+
+### `syz_pause`, `syz_play`
+
+```
+syz_ErrorCode syz_pause(syz_Handle object);
+syz_ErrorCode syz_play(syz_Handle object);
+```
+
+The standard play/pause functions, which do exactly what their name suggests.
+
+When the context is paused, nothing it manages advances and no audio is audible.
 
 ## Remarks
 

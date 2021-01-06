@@ -1,5 +1,7 @@
 #include "synthizer/buffer.hpp"
 
+#include "synthizer_constants.h"
+
 #include "synthizer/c_api.hpp"
 #include "synthizer/context.hpp"
 #include "synthizer/decoding.hpp"
@@ -67,7 +69,7 @@ std::shared_ptr<BufferData> generateBufferData(unsigned int channels, unsigned i
 		working_buf = new float[chunk_size_samples];
 
 		while (last == false) {
-			next_chunk = allocAligned<std::int16_t>(channels * config::BUFFER_CHUNK_SIZE);
+			next_chunk = (std::int16_t *)calloc(channels * config::BUFFER_CHUNK_SIZE, sizeof(std::int16_t));
 			std::size_t next_chunk_len = 0;
 
 			if (resampler != nullptr) {
@@ -102,10 +104,10 @@ std::shared_ptr<BufferData> generateBufferData(unsigned int channels, unsigned i
 		return allocateSharedDeferred<BufferData>(channels, length, std::move(chunks));
 	} catch(...) {
 		for (auto x: chunks) {
-			freeAligned(x);
+			deferredFree(x);
 		}
 		delete resampler;
-		freeAligned(next_chunk);
+		deferredFree(next_chunk);
 		delete[] working_buf;
 		throw;
 	}
@@ -117,6 +119,10 @@ std::shared_ptr<BufferData> bufferDataFromDecoder(const std::shared_ptr<AudioDec
 	return generateBufferData(channels, sr, [&](auto frames, float *dest) {
 		return decoder->writeSamplesInterleaved(frames, dest);
 	});
+}
+
+int Buffer::getObjectType() {
+	return SYZ_OTYPE_BUFFER;
 }
 
 }
